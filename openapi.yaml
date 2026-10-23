@@ -1,0 +1,803 @@
+openapi: 3.0.3
+info:
+  title: Hub Contábil — API pública
+  version: '1.0.0'
+  description: |
+    API REST versionada do Hub Contábil. A `/v1` é o namespace público do
+    sistema: o primeiro módulo exposto é a **emissão de NFS-e** (invoices),
+    e novos módulos entram sob o mesmo prefixo.
+
+    ## Autenticação
+
+    `Authorization: Bearer <chave>` — chaves `hk_live_…` (produção) e
+    `hk_test_…` (simulação). Crie/revoque em **Emissão de NFS-e →
+    Integrações (API)** no app. A chave cheia só é exibida na criação.
+
+    Chaves `hk_test_` emitem no **provider mock**: a nota é gravada e
+    retornada normalmente, mas nada é transmitido ao SEFIN e nenhum crédito
+    é debitado. No contrato, `livemode: false` marca esses registros.
+
+    ## Erros
+
+    Envelope único: `{ "error": { "code", "message", "request_id" } }` —
+    `request_id` também vai no header `X-Request-Id` da resposta.
+
+    | HTTP | codes |
+    |---|---|
+    | 400 | `INVALID_INPUT`, `CERTIFICATE_NOT_CONFIGURED`, `CERTIFICATE_INVALID`, `SIGNATURE_ERROR` |
+    | 401 | `UNAUTHORIZED` (chave ausente/inválida/revogada) |
+    | 402 | `INSUFFICIENT_CREDITS` (carteira do emissor avulso) |
+    | 403 | `FORBIDDEN` (produto `hub-api` inativo ou escopo ausente) |
+    | 404 | `NOT_FOUND` |
+    | 409 | `ALREADY_CANCELLED`, `IN_PROGRESS` (mesma `external_ref` em emissão) |
+    | 422 | `REJECTED` (rejeição fiscal do SEFIN) |
+    | 429 | `RATE_LIMITED`, `PROVIDER_RATE_LIMITED` (com `Retry-After`) |
+    | 502 | `PROVIDER_UNAVAILABLE`, `STORAGE_ERROR`, demais |
+
+    ## Rate limit
+
+    60 requisições/minuto por chave, por instância do worker. Estouro →
+    `429` + `Retry-After` (segundos).
+
+    ## Idempotência
+
+    `POST /v1/invoices` aceita `external_ref` no corpo **ou** o header
+    `Idempotency-Key` como fallback. Mesma `(empresa, referência)` nunca
+    emite duas DPS: a segunda chamada devolve a nota já criada com
+    `replayed: true`, `409 IN_PROGRESS` se uma emissão estiver em curso, ou
+    uma nova tentativa se a anterior falhou.
+
+    ## Webhooks
+
+    Endpoints HTTPS configurados no painel recebem POST assinado:
+
+    ```
+    X-Hub-Event: invoice.issued
+    X-Hub-Delivery: <delivery id>
+    X-Hub-Signature: t=<unix>,v1=<HMAC-SHA256(secret, "<t>.<body>")>
+    ```
+
+    Corpo: `{ id, event, created_at, livemode, data }`. Responda 2xx;
+    falhas retentam com backoff (1min → 12h, até 8 tentativas/24h). O
+    segredo `whsec_…` é exibido uma vez na criação (rotação disponível no
+    painel). Eventos de `invoice.*`: `invoice.issued`, `invoice.cancelled`,
+    `invoice.failed`.
+servers:
+  - url: https://api.hub-contabil.com
+security:
+  - bearerAuth: []
+tags:
+  - name: fundação
+  - name: nfse
+paths:
+  /v1/meta:
+    get:
+      tags: [fundação]
+      summary: Escopos e eventos de webhook disponíveis
+      description: Não exige autenticação.
+      security: []
+      responses:
+        '200':
+          description: Catálogo de escopos e eventos
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  scopes: { type: array, items: { type: string } }
+                  webhook_events: { type: array, items: { type: string } }
+  /v1/companies:
+    get:
+      tags: [nfse]
+      summary: Empresas da conta
+      description: Escopo `companies:read`. Só empresas da conta dona da chave.
+      responses:
+        '200':
+          description: Lista de empresas
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Company' }
+  /v1/invoices:
+    post:
+      tags: [nfse]
+      summary: Emitir NFS-e (síncrono)
+      description: |
+        Escopo `nfse:write`. Emite e já devolve a nota autorizada — o
+        pipeline é o mesmo da emissão pelo app (DPS numerada na série
+        `00800`, XML/PDF em storage privado, e-mail ao tomador por padrão).
+        `hk_test_` vai ao mock (`livemode: false`). O pedido é
+        autossuficiente: a empresa prestadora é resolvida por `company_id`
+        (cadastrada) ou `prestador.cnpj` (find-or-create na conta), e o
+        certificado A1 vem do campo `certificate` (efêmero, só memória) ou,
+        na falta dele, do certificado cadastrado da empresa. Objetos
+        aninhados (`endereco`, `tributos_federais`, `comercio_exterior`…)
+        aceitam chaves em snake_case ou camelCase — as duas formas são
+        normalizadas para o formato interno. Dica: `GET /v1/invoices/suggestions`
+        devolve tomador/serviço preenchidos a partir do histórico da conta e
+        `GET /v1/service-codes` ajuda a achar o `codigo_tributacao_nacional`.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema: { type: string }
+          description: Fallback de `external_ref` para deduplicação.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InvoiceEmitRequest' }
+      responses:
+        '201': { description: Nota emitida, content: { application/json: { schema: { $ref: '#/components/schemas/InvoiceEmitResponse' } } } }
+        '200': { description: 'Replay idempotente (`replayed: true`)', content: { application/json: { schema: { $ref: '#/components/schemas/InvoiceEmitResponse' } } } }
+        '402': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+    get:
+      tags: [nfse]
+      summary: Listar notas emitidas
+      description: Escopo `nfse:read`. Paginação por cursor `created_at|id`.
+      parameters:
+        - { name: company_id, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, enum: [autorizada, cancelada] } }
+        - { name: external_ref, in: query, schema: { type: string } }
+        - { name: livemode, in: query, schema: { type: string, enum: ['true', 'false'] } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 25 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: Página de notas
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Invoice' } }
+                  has_more: { type: boolean }
+                  next_cursor: { type: string, nullable: true }
+  /v1/invoices/suggestions:
+    get:
+      tags: [nfse]
+      summary: Sugestões de preenchimento (o "para quem?" e o "o quê?")
+      description: |
+        Escopo `nfse:read`. É a mesma expertise do assistente de emissão do
+        app: o Hub varre o histórico da conta — notas emitidas por aqui e
+        NFS-e prestadas sincronizadas do ADN — e devolve os **tomadores** e
+        **serviços** mais recentes/frequentes, já no formato exato do
+        `POST /v1/invoices`. É o autopreenchimento da API: pegue a sugestão,
+        ajuste o que mudou (valor, competência) e emita — sem consultar o
+        cadastro da prefeitura nem decorar código de serviço.
+        `?company_id=` ou `?cnpj=` limita a uma empresa da conta.
+      parameters:
+        - name: company_id
+          in: query
+          schema: { type: string }
+          description: 'Limita as sugestões a uma empresa (id de `GET /v1/companies`).'
+        - name: cnpj
+          in: query
+          schema: { type: string }
+          description: 'Alternativa ao `company_id` — o CNPJ do prestador (14 dígitos).'
+      responses:
+        '200':
+          description: Sugestões ordenadas por recência e frequência
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      tomadores:
+                        type: array
+                        description: 'Clientes que já receberam nota — copie `tomador` direto no pedido.'
+                        items:
+                          type: object
+                          properties:
+                            ultimo_uso: { type: string, description: 'Data da emissão mais recente para este tomador.' }
+                            quantidade: { type: integer, description: 'Quantas notas ele recebeu no histórico.' }
+                            company_id: { type: string, description: 'Empresa que emitiu para ele.' }
+                            tomador: { type: object, description: 'Mesmo formato do campo `tomador` do `InvoiceEmitRequest`.' }
+                      servicos:
+                        type: array
+                        description: 'Serviços já emitidos — copie `servico` + `valores` no pedido.'
+                        items:
+                          type: object
+                          properties:
+                            ultimo_uso: { type: string, description: 'Data da emissão mais recente com este serviço.' }
+                            quantidade: { type: integer, description: 'Quantas notas usaram este serviço.' }
+                            company_id: { type: string, description: 'Empresa que emitiu.' }
+                            servico: { type: object, description: 'Mesmo formato do campo `servico` do `InvoiceEmitRequest`.' }
+                            valores: { type: object, description: '`tributacao_issqn`, `aliquota_iss` e `iss_retido` usados da última vez.' }
+  /v1/service-codes:
+    get:
+      tags: [nfse]
+      summary: Catálogo de códigos de serviço (Lista de Serviço, LC 116)
+      description: |
+        Escopo `nfse:read`. A Lista de Serviço Nacional completa — a mesma
+        que alimenta o seletor de `codigo_tributacao_nacional` no app do
+        Hub. Use `?q=` para buscar por código ou trecho da descrição
+        (ignora acentos): `?q=consultoria`, `?q=programacao`, `?q=0101`.
+        O `codigo` retornado vai direto em
+        `servico.codigo_tributacao_nacional` no pedido de emissão.
+      parameters:
+        - name: q
+          in: query
+          schema: { type: string }
+          description: 'Busca por código ou trecho da descrição do serviço.'
+      responses:
+        '200':
+          description: Catálogo completo ou filtrado por `q`
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        codigo: { type: string, description: 'Item da LC 116, 6 dígitos — vai em `servico.codigo_tributacao_nacional`.' }
+                        descricao: { type: string, description: 'Descrição oficial do serviço na Lista de Serviço Nacional.' }
+  /v1/invoices/{id}:
+    get:
+      tags: [nfse]
+      summary: Detalhe da nota
+      description: Escopo `nfse:read`. Nota de outra conta responde 404.
+      parameters: [{ $ref: '#/components/parameters/InvoiceId' }]
+      responses:
+        '200':
+          description: Nota
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { invoice: { $ref: '#/components/schemas/Invoice' } }
+  /v1/invoices/{id}/files:
+    get:
+      tags: [nfse]
+      summary: URL assinada do XML ou PDF (DANFSe)
+      description: Escopo `nfse:read`. URL temporária (60min) — paths internos nunca são expostos.
+      parameters:
+        - { $ref: '#/components/parameters/InvoiceId' }
+        - { name: type, in: query, schema: { type: string, enum: [xml, pdf], default: xml } }
+      responses:
+        '200':
+          description: URL assinada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url: { type: string }
+                  expires_in_seconds: { type: integer }
+  /v1/invoices/{id}/cancel:
+    post:
+      tags: [nfse]
+      summary: Cancelar nota (evento e101101)
+      description: |
+        Escopo `nfse:write`. Registra o cancelamento no SEFIN Nacional pela
+        empresa prestadora — o certificado A1 vem do campo `certificate`
+        (efêmero) ou do certificado cadastrado da empresa. Chave de teste
+        só cancela nota emitida em teste.
+      parameters: [{ $ref: '#/components/parameters/InvoiceId' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                codigo_motivo: { type: string, enum: ['1', '2', '9'], default: '2', description: '1=erro na emissão, 2=serviço não prestado, 9=outros' }
+                motivo: { type: string, minLength: 15, maxLength: 255 }
+                certificate: { $ref: '#/components/schemas/EphemeralCertificate' }
+      responses:
+        '200':
+          description: Nota cancelada
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cancelled: { type: boolean }
+                  id: { type: string }
+        '409': { $ref: '#/components/responses/Error' }
+  /v1/invoices/{id}/resend:
+    post:
+      tags: [nfse]
+      summary: Reenviar nota por e-mail
+      description: 'Escopo `nfse:write`. Default: e-mail do tomador da nota.'
+      parameters: [{ $ref: '#/components/parameters/InvoiceId' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { email: { type: string, format: email } }
+      responses:
+        '200':
+          description: Resultado do envio
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+                  error: { type: string, nullable: true }
+  /v1/imports:
+    post:
+      tags: [nfse]
+      summary: Importar XML de NFS-e
+      description: |
+        Escopo `imports:write`. Registra o XML como nota importada — modelo
+        para copiar/emitir e recorrências. Aceita `xml` (texto) ou
+        `xml_base64`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                xml: { type: string }
+                xml_base64: { type: string }
+      responses:
+        '201': { description: XML importado, content: { application/json: { schema: { type: object } } } }
+  /v1/recurrences:
+    get:
+      tags: [nfse]
+      summary: Listar recorrências mensais
+      description: Escopo `recurrences:read`.
+      parameters:
+        - { name: company_id, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: Lista de recorrências
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { type: object } }
+    post:
+      tags: [nfse]
+      summary: Criar recorrência mensal
+      description: |
+        Escopo `recurrences:write`. Emite todo mês no `day_of_month` (1–28)
+        a partir do `payload` (mesmo formato do POST /v1/invoices) ou de uma
+        nota de origem (`source`). `delivery_email` é obrigatório — a nota é
+        enviada ao tomador a cada emissão.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [day_of_month]
+              properties:
+                day_of_month: { type: integer, minimum: 1, maximum: 28 }
+                payload: { $ref: '#/components/schemas/InvoiceEmitRequest' }
+                source:
+                  type: object
+                  properties:
+                    type: { type: string, enum: [issued, document, imported] }
+                    id: { type: string }
+                delivery_email: { type: string, format: email }
+                copy_email: { type: string, format: email }
+      responses:
+        '201': { description: Recorrência criada, content: { application/json: { schema: { type: object, properties: { id: { type: string } } } } } }
+  /v1/recurrences/{id}:
+    patch:
+      tags: [nfse]
+      summary: Ajustar e-mails da recorrência
+      description: Escopo `recurrences:write`. `delivery_email` e/ou `copy_email` (vazio remove a cópia).
+      parameters: [{ $ref: '#/components/parameters/RecurrenceId' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                delivery_email: { type: string, format: email }
+                copy_email: { type: string, format: email, nullable: true }
+      responses:
+        '200': { description: Atualizada }
+    delete:
+      tags: [nfse]
+      summary: Cancelar recorrência
+      description: Escopo `recurrences:write`. Para recriar com outro dia, cancele e crie de novo.
+      parameters: [{ $ref: '#/components/parameters/RecurrenceId' }]
+      responses:
+        '200': { description: Cancelada }
+  /v1/wallet:
+    get:
+      tags: [nfse]
+      summary: Carteira de créditos do emissor avulso
+      description: Escopo `wallet:read`. Saldo e preço por nota em centavos.
+      responses:
+        '200':
+          description: Saldo da carteira
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  balance_cents: { type: integer }
+                  price_per_note_cents: { type: integer }
+                  billing_enabled: { type: boolean }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: hk_live_…/hk_test_…
+  parameters:
+    InvoiceId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    RecurrenceId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  responses:
+    Error:
+      description: Erro no envelope padrão
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+            request_id: { type: string }
+    Company:
+      type: object
+      properties:
+        id: { type: string }
+        cnpj: { type: string }
+        razao_social: { type: string }
+        cod_municipio: { type: string, nullable: true }
+        inscricao_municipal: { type: string, nullable: true }
+    Invoice:
+      type: object
+      properties:
+        id: { type: string }
+        company_id: { type: string }
+        status: { type: string }
+        livemode: { type: boolean }
+        environment: { type: string }
+        provider: { type: string }
+        external_ref: { type: string, nullable: true }
+        numero_nfse: { type: string, nullable: true }
+        chave_acesso: { type: string, nullable: true }
+        dps:
+          type: object
+          properties:
+            serie: { type: string }
+            numero: { type: integer }
+        tomador:
+          type: object
+          properties:
+            tipo_documento: { type: string, nullable: true }
+            documento: { type: string, nullable: true }
+            nome: { type: string, nullable: true }
+            email: { type: string, nullable: true }
+        servico:
+          type: object
+          properties:
+            codigo: { type: string }
+            descricao: { type: string }
+            codigo_municipio_incidencia: { type: string, nullable: true }
+        valor_servico: { type: number }
+        aliquota_iss: { type: number }
+        iss_retido: { type: integer }
+        data_competencia: { type: string, nullable: true }
+        data_emissao: { type: string }
+        cancelled_at: { type: string, nullable: true }
+        cancel_reason: { type: string, nullable: true }
+        created_at: { type: string }
+    InvoiceEmitRequest:
+      type: object
+      required: [tomador, servico, valores, competencia]
+      properties:
+        company_id:
+          type: string
+          format: uuid
+          description: |
+            Empresa já cadastrada. Sem `company_id`, `prestador.cnpj` resolve
+            a empresa por find-or-create na conta — o pedido fica
+            autossuficiente e os campos fiscais enviados atualizam o
+            cadastro. Com `company_id`, o cadastro é a fonte de verdade e
+            divergência nos campos retorna 400.
+        external_ref:
+          type: string
+          description: Referência do integrador (pedido/pagamento) — chave de idempotência.
+        competencia: { type: string, format: date, description: 'YYYY-MM-DD' }
+        prestador:
+          type: object
+          properties:
+            cnpj: { type: string, description: '14 dígitos — obrigatório sem company_id' }
+            razao_social: { type: string, description: 'Obrigatória ao criar a empresa via CNPJ' }
+            nome_fantasia: { type: string }
+            codigo_municipio: { type: string, description: 'IBGE, 7 dígitos' }
+            inscricao_municipal: { type: string }
+            opcao_simples_nacional: { type: integer }
+            regime_apuracao_simples: { type: integer }
+            regime_especial_tributacao: { type: integer }
+            fone: { type: string }
+            email: { type: string, format: email }
+          description: 'Com company_id: defaults do cadastro, divergência retorna 400. Com cnpj: os campos enviados atualizam o cadastro.'
+        tomador:
+          type: object
+          description: |
+            Quem recebe o serviço (o cliente da nota). `documento` aceita
+            CNPJ/CPF só com dígitos; para tomador estrangeiro use
+            `tipo_documento: NIF` com o número fiscal do país dele, ou
+            omita o documento informando `motivo_sem_nif`. `nome` é
+            obrigatório pela prefeitura — é o que sai no DANFSe.
+            Cliente recorrente? `GET /v1/invoices/suggestions` devolve este
+            bloco preenchido a partir do histórico da conta.
+          properties:
+            tipo_documento:
+              type: string
+              enum: [CNPJ, CPF, NIF]
+              description: 'CNPJ/CPF = tomador brasileiro; NIF = estrangeiro com identificação fiscal no país dele. Omitido = não informado.'
+            documento:
+              type: string
+              description: 'Só dígitos para CNPJ (14) e CPF (11); para NIF, o número fiscal estrangeiro como está.'
+            motivo_sem_nif:
+              type: string
+              enum: ['0', '1', '2']
+              description: 'Motivo do estrangeiro sem NIF: 0 = não informado na nota origem · 1 = dispensado de NIF · 2 = não exigido.'
+            inscricao_municipal:
+              type: string
+              description: 'Inscrição municipal do tomador — raro, só quando a prefeitura exige para tomadores que também prestam serviço.'
+            nome: { type: string, description: 'Razão social ou nome completo — sai no DANFSe.' }
+            email:
+              type: string
+              format: email
+              description: 'Recebe a nota por e-mail quando `send_email` está ativo (default).'
+            fone: { type: string, description: 'DDD + número, só dígitos.' }
+            endereco: { $ref: '#/components/schemas/Endereco' }
+        servico:
+          type: object
+          required: [codigo_tributacao_nacional, descricao]
+          description: |
+            O que está sendo prestado. `codigo_tributacao_nacional` é o
+            item da LC 116/2003 em 6 dígitos (ex.: `010101` = análise e
+            desenvolvimento de sistemas) e é o que define a tributação —
+            descubra o item em `GET /v1/service-codes` ou reaproveite de
+            `GET /v1/invoices/suggestions` (serviços já emitidos voltam
+            prontos aqui).
+          properties:
+            codigo_tributacao_nacional:
+              type: string
+              description: 'Item da LC 116, 6 dígitos — obrigatório (cTribNac). Não sabe o código? Busque em `GET /v1/service-codes` ou reaproveite de `GET /v1/invoices/suggestions`.'
+            codigo_tributacao_municipal:
+              type: string
+              description: 'Código de tributação do município (cTribMun, 3 dígitos) — só quando a cidade exige.'
+            descricao: { type: string, description: 'Texto livre do serviço — sai na nota (xDescServ).' }
+            codigo_nbs: { type: string, description: 'Código NBS, 9 dígitos — opcional.' }
+            codigo_interno:
+              type: string
+              description: 'Seu código interno do serviço (cIntContrib) — volta no XML como referência.'
+            codigo_municipio_incidencia:
+              type: string
+              description: 'Município IBGE (7 dígitos) onde o serviço incide. Omitido = município do prestador — só mude quando a regra de ISS mandar outra cidade (ex.: construção civil na cidade da obra).'
+            codigo_obra: { type: string, description: 'CNO/CEI da obra — construção civil.' }
+            codigo_cib:
+              type: string
+              description: 'CIB — Cadastro Imobiliário Brasileiro (8 dígitos); alternativa ao `codigo_obra`.'
+            inscricao_imobiliaria_fiscal:
+              type: string
+              description: 'Inscrição imobiliária (IPTU) do imóvel da obra (inscImobFisc).'
+            endereco_obra:
+              description: 'Endereço da obra quando ela não tem CNO nem CIB.'
+              allOf:
+                - $ref: '#/components/schemas/Endereco'
+            comercio_exterior: { $ref: '#/components/schemas/ComercioExterior' }
+            informacoes_complementares:
+              type: string
+              description: 'Texto extra na nota (xInfComp) — número de contrato, condições, dados bancários…'
+        valores:
+          type: object
+          required: [valor_servico]
+          description: 'Valores e tributação do serviço — só `valor_servico` é obrigatório; o resto segue a regra fiscal.'
+          properties:
+            valor_servico:
+              type: number
+              description: 'Valor do serviço em reais — ex.: 1500.00 (vServ).'
+            desconto_incondicionado:
+              type: number
+              description: 'Desconto dado sem condição — abate direto o valor tributado (vDescIncond).'
+            desconto_condicionado:
+              type: number
+              description: 'Desconto condicionado a algo (retenção, pagamento à vista…) — vDescCond.'
+            tributacao_issqn:
+              type: integer
+              enum: [1, 2, 3, 4]
+              description: 'Como o ISS incide: 1 = tributável (padrão) · 2 = imunidade · 3 = exportação de serviço · 4 = não incidência. Com 3, `servico.comercio_exterior` é obrigatório.'
+            aliquota_iss:
+              type: number
+              nullable: true
+              description: 'Alíquota do ISS em % — ex.: 2 para 2%. Omitida, a prefeitura aplica a alíquota padrão do serviço.'
+            iss_retido:
+              type: boolean
+              description: 'true = o tomador retém o ISS na fonte (ele recolhe); false ou omitido = o prestador recolhe (padrão).'
+            tributos_federais: { $ref: '#/components/schemas/TributosFederais' }
+            total_tributos: { $ref: '#/components/schemas/TotalTributos' }
+        certificate: { $ref: '#/components/schemas/EphemeralCertificate' }
+        send_email: { type: boolean, default: true, description: 'Enviar XML+DANFSe ao tomador' }
+        email_to: { type: string, format: email, description: 'Destinatário; default: tomador.email' }
+    Endereco:
+      type: object
+      description: |
+        Endereço completo. `logradouro`, `numero` e `bairro` são texto livre;
+        a localização vai em **um** dos grupos — `nacional` para endereço no
+        Brasil (município IBGE + CEP) ou `exterior` para fora do país
+        (tomador estrangeiro). As chaves aceitam snake_case ou camelCase
+        (`codigo_municipio` ou `codigoMunicipio`) — as duas formas funcionam.
+      properties:
+        logradouro: { type: string, description: 'Rua/avenida — ex.: "Av. Paulista".' }
+        numero: { type: string, description: 'Número — texto livre, aceita "1000", "S/N", "km 12".' }
+        complemento: { type: string, description: 'Opcional — sala, andar, bloco, galpão…' }
+        bairro: { type: string, description: 'Bairro ou distrito.' }
+        nacional:
+          type: object
+          required: [codigo_municipio, cep]
+          description: 'Endereço no Brasil — preencha este **ou** `exterior`, nunca os dois.'
+          properties:
+            codigo_municipio:
+              type: string
+              description: 'Código IBGE do município, 7 dígitos — ex.: "3550308" = São Paulo/SP, "3304557" = Rio de Janeiro/RJ.'
+            cep: { type: string, description: 'CEP só com dígitos, 8 caracteres — ex.: "01310100".' }
+        exterior:
+          type: object
+          required: [codigo_pais]
+          description: 'Endereço fora do Brasil — preencha este **ou** `nacional`, nunca os dois.'
+          properties:
+            codigo_pais:
+              type: string
+              description: 'Código do país na tabela Siscomex/BACEN — ex.: "2496" Estados Unidos, "0639" Argentina, "5103" Portugal.'
+            codigo_postal: { type: string, description: 'CEP/ZIP/postal code do país, no formato local.' }
+            cidade: { type: string, description: 'Cidade estrangeira — ex.: "Lisboa".' }
+            estado_provincia_regiao:
+              type: string
+              description: 'Estado, província ou região do país — ex.: "FL", "Provence".'
+    TributosFederais:
+      type: object
+      description: |
+        Tributos federais e retenções da nota (grupo `tribFed`). Informe só
+        quando a nota detalha PIS/COFINS ou tem imposto retido na fonte —
+        a maioria das notas (incluindo Simples Nacional) deixa este grupo
+        de fora. Chaves em snake_case ou camelCase.
+      properties:
+        pis_cofins:
+          type: object
+          required: [cst]
+          description: 'Grupo PIS/COFINS — quando a nota detalha a contribuição.'
+          properties:
+            cst:
+              type: string
+              description: 'CST de PIS/COFINS, 2 dígitos — ex.: "01" tributado, "06" alíquota zero, "08" sem incidência.'
+            base: { type: number, description: 'Base de cálculo em reais (vBCPisCofins).' }
+            aliquota_pis: { type: number, description: 'Alíquota de PIS em % — ex.: 0.65.' }
+            aliquota_cofins: { type: number, description: 'Alíquota de COFINS em % — ex.: 3.0.' }
+            valor_pis: { type: number, description: 'Valor do PIS em reais (vPis).' }
+            valor_cofins: { type: number, description: 'Valor do COFINS em reais (vCofins).' }
+            tipo_retencao:
+              type: string
+              description: 'Tipo de retenção de PIS/COFINS (tpRetPisCofins, "0" a "9") — só quando há retenção.'
+        retencao_cp:
+          type: number
+          description: 'Contribuição previdenciária retida (INSS 11% de PJ), em reais — vRetCP.'
+        retencao_irrf: { type: number, description: 'IRRF retido na fonte, em reais — vRetIRRF.' }
+        retencao_csll: { type: number, description: 'CSLL retida, em reais — vRetCSLL.' }
+    TotalTributos:
+      type: object
+      description: |
+        Valor aproximado dos tributos da nota (grupo `totTrib`). O padrão do
+        leiaute é **não informar** — omita o objeto ou use
+        `tipo: nao_informar`. Os demais modos servem para mostrar a carga
+        tributária na nota:
+
+        - `simples` — só `percentual`: a alíquota efetiva do Simples Nacional;
+        - `valor` — `federal`, `estadual` e `municipal` **em reais**;
+        - `percentual` — os mesmos três **em %** sobre o serviço.
+
+        Tetos do leiaute: em reais, até R$ 999.999.999,99 por esfera; em
+        percentual, até 100 % no modo `simples` e 0–1000 % por esfera no
+        modo `percentual`.
+      properties:
+        tipo:
+          type: string
+          enum: [nao_informar, simples, valor, percentual]
+          description: 'Qual forma de informar — ver a descrição do objeto.'
+        percentual:
+          type: number
+          description: 'Só com `tipo: simples` — alíquota total do Simples em % sobre o serviço (pTotTribSN).'
+        federal:
+          type: number
+          description: 'Com `valor`: tributos federais em R$; com `percentual`: em % — vTotTribFed/pTotTribFed.'
+        estadual:
+          type: number
+          description: 'Com `valor`: tributos estaduais em R$; com `percentual`: em % — vTotTribEst/pTotTribEst.'
+        municipal:
+          type: number
+          description: 'Com `valor`: tributos municipais em R$; com `percentual`: em % — vTotTribMun/pTotTribMun.'
+    ComercioExterior:
+      type: object
+      required: [modo_prestacao, vinculo_prestacao, tipo_moeda, valor_servico_moeda]
+      description: |
+        Dados de exportação/importação de serviço (grupo `serv/comExt`).
+        Obrigatório quando `valores.tributacao_issqn = 3` (exportação) ou
+        quando o tomador tem `endereco.exterior`; fora desses casos deixe
+        de fora. Chaves em snake_case ou camelCase.
+      properties:
+        modo_prestacao:
+          type: integer
+          enum: [0, 1, 2, 3, 4]
+          description: 'Como o serviço é prestado: 0 = desconhecido · 1 = transfronteiriço (prestador no Brasil, tomador fora, sem se deslocar) · 2 = consumo no Brasil · 3 = presença comercial no exterior · 4 = movimento temporário de pessoas físicas.'
+        vinculo_prestacao:
+          type: integer
+          enum: [0, 1, 2, 3, 4, 5, 6, 9]
+          description: 'Vínculo entre prestador e tomador: 0 = sem vínculo · 1 = controlada · 2 = controladora · 3 = coligada · 4 = matriz · 5 = filial/sucursal · 6 = outro vínculo · 9 = desconhecido.'
+        tipo_moeda:
+          type: string
+          description: 'Código BACEN da moeda do pagamento (3 dígitos) — ex.: "220" dólar EUA, "978" euro, "540" libra esterlina.'
+        valor_servico_moeda:
+          type: number
+          description: 'Valor do serviço na moeda estrangeira (vServMoeda) — ex.: 1000.00 = US$ 1.000,00.'
+        mecanismo_apoio_prestador:
+          type: string
+          description: 'Mecanismo de apoio/fomento ao comex usado pelo prestador (mecAFComexP, "00" a "08").'
+        mecanismo_apoio_tomador:
+          type: string
+          description: 'Mecanismo de apoio/fomento ao comex usado pelo tomador (mecAFComexT, "00" a "26").'
+        movimentacao_temporaria_bens:
+          type: integer
+          enum: [0, 1, 2, 3]
+          description: 'Bens vinculados à prestação: 0 = desconhecido · 1 = sem movimentação · 2 = com declaração de importação (DI) · 3 = com registro de exportação (RE).'
+        numero_declaracao_importacao:
+          type: string
+          description: 'Número da DI averbada, até 12 caracteres alfanuméricos — só quando `movimentacao_temporaria_bens` = 2.'
+        numero_registro_exportacao:
+          type: string
+          description: 'Número do RE averbado, até 12 caracteres alfanuméricos — só quando `movimentacao_temporaria_bens` = 3.'
+        envio_mdic:
+          type: integer
+          enum: [0, 1]
+          description: '0 = não disponibilizar ao MDIC · 1 = disponibilizar no Siscoserv (mdic).'
+    EphemeralCertificate:
+      type: object
+      required: [pfx_base64, password]
+      description: |
+        Certificado A1 do prestador enviado no pedido — uso efêmero (lido só
+        em memória, nunca persistido) com prioridade sobre o certificado
+        cadastrado da empresa; sem nenhum dos dois a chamada falha com
+        CERTIFICATE_NOT_CONFIGURED. Chaves `hk_test_` (mock) ignoram o campo.
+        Não é aceito em `payload` de recorrência (a emissão mensal exige o
+        certificado cadastrado).
+      properties:
+        pfx_base64: { type: string, format: byte, description: 'Arquivo .pfx/.p12 do A1 em base64' }
+        password: { type: string, description: 'Senha do PFX' }
+    InvoiceEmitResponse:
+      type: object
+      properties:
+        invoice: { $ref: '#/components/schemas/Invoice' }
+        replayed: { type: boolean }
+        email_status: { type: string, nullable: true }
