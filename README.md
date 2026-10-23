@@ -52,7 +52,7 @@ Authorization: Bearer hk_test_xxxxxxxx   # teste — provider mock, nada vai ao 
 Envelope único em qualquer falha:
 
 ```json
-{ "error": { "code": "INVALID_INPUT", "message": "Informe company_id.", "request_id": "…" } }
+{ "error": { "code": "INVALID_INPUT", "message": "Informe company_id ou prestador.cnpj (14 dígitos).", "request_id": "…" } }
 ```
 
 `request_id` também vai no header `X-Request-Id` — inclua-o em logs e ao abrir
